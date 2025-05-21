@@ -22,6 +22,7 @@ class SensorInstance(QObject):
         self.sensor_id = sensor_id
         self.config = config # name, type, protocol, port, baudrate, address, etc.
         self._is_connected = False
+        self._connection_error_message = None # Added to store error messages
         self._running = False
         self.thread = None
         self.worker = None # Sẽ là một worker tương tự SensorWorker hiện tại
@@ -32,7 +33,8 @@ class SensorInstance(QObject):
             'id': self.sensor_id,
             'config': self.config,
             'connected': self._is_connected,
-            'type': self.config.get('type', 'N/A')
+            'type': self.config.get('type', 'N/A'),
+            'connection_error': self._connection_error_message # Expose error message
         }
 
     @property
@@ -46,6 +48,7 @@ class SensorInstance(QObject):
 
         logger.info(f"Attempting to connect sensor {self.sensor_id} with config: {self.config}")
         self._running = True
+        self._connection_error_message = None # Clear any previous error message
         
         # Tạo worker dựa trên protocol và type
         # Đây là phần tương tự như SensorWorker hiện tại của bạn
@@ -87,14 +90,17 @@ class SensorInstance(QObject):
         self.last_data = data_dict
         self.newData.emit(self.sensor_id, data_dict)
 
-
     def _on_worker_connection_status(self, connected_status, message_text): # Worker sẽ không gửi sensor_id
         self._is_connected = connected_status
-        # Nếu kết nối thất bại ngay từ đầu, worker có thể tự dừng
-        if not self._is_connected and not self.worker._running_flag_from_manager: # Giả sử worker có cờ này
+        if not connected_status:
+            self._connection_error_message = message_text # Store error message on failure
+        else:
+            self._connection_error_message = None # Clear error on successful connection
+
+        # If connection failed immediately, worker might stop itself
+        if not self._is_connected and not self.worker._running_flag_from_manager:
              self._running = False # Đặt lại cờ của SensorInstance
         self.connectionStatus.emit(self.sensor_id, self._is_connected, message_text)
-
 
     def _on_worker_stopped(self): # Worker sẽ không gửi sensor_id
         logger.info(f"Worker for sensor {self.sensor_id} has stopped.")
@@ -112,7 +118,6 @@ class SensorInstance(QObject):
         self.thread = None # Giải phóng thread
         self.stopped.emit(self.sensor_id) # Thông báo rằng instance này đã dừng hẳn
 
-
     def disconnect_sensor(self):
         logger.info(f"Requesting to disconnect sensor {self.sensor_id}")
         if self.worker and self._running:
@@ -122,7 +127,6 @@ class SensorInstance(QObject):
             self._running = False
             self._is_connected = False
             self.stopped.emit(self.sensor_id)
-
 
     def cleanup(self): # Được gọi bởi SensorManager trước khi xóa instance
         self.disconnect_sensor()
@@ -297,6 +301,59 @@ class SensorManager(QObject):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._sensors = {} # dict_of_sensor_id: SensorInstance
+        self._active_resources = {} # Track actively used resources: {resource_key: sensor_id}
+        self._configured_resources = {} # Track configured resources: {resource_key: sensor_id}
+
+    def _get_resource_key(self, config):
+        """Generate a unique key for a resource based on its protocol and configuration."""
+        protocol = config.get('protocol')
+        if protocol == "UART":
+            return f"UART:{config.get('port')}"
+        elif protocol in ["TCP/IP", "UDP"]:
+            addr = config.get('address')
+            if isinstance(addr, (list, tuple)) and len(addr) == 2:
+                return f"{protocol}:{addr[0]}:{addr[1]}"
+            return f"{protocol}:{addr}"
+        elif protocol == "Bluetooth":
+            return f"BT:{config.get('mac_address')}"
+        elif protocol == "Mock":
+            return f"Mock:{config.get('id')}" # Use sensor ID for mock sensors
+        return None
+
+    def _check_resource_conflict(self, sensor_id, config):
+        """Check if a resource is already in use or configured by another sensor."""
+        resource_key = self._get_resource_key(config)
+        if not resource_key:
+            return False, "Invalid resource configuration"
+
+        # Check if resource is actively used
+        if resource_key in self._active_resources:
+            other_sensor_id = self._active_resources[resource_key]
+            if other_sensor_id != sensor_id:
+                other_info = self.get_sensor_info(other_sensor_id)
+                other_name = other_info.get('config', {}).get('name', other_sensor_id)
+                return True, f"Resource is actively used by sensor '{other_name}' (ID: {other_sensor_id})"
+
+        # Check if resource is configured by another sensor
+        if resource_key in self._configured_resources:
+            other_sensor_id = self._configured_resources[resource_key]
+            if other_sensor_id != sensor_id:
+                other_info = self.get_sensor_info(other_sensor_id)
+                other_name = other_info.get('config', {}).get('name', other_sensor_id)
+                return True, f"Resource is configured for sensor '{other_name}' (ID: {other_sensor_id})"
+
+        return False, None
+
+    def _update_resource_tracking(self, sensor_id, config, is_connected):
+        """Update resource tracking when a sensor's connection status changes."""
+        resource_key = self._get_resource_key(config)
+        if not resource_key:
+            return
+
+        if is_connected:
+            self._active_resources[resource_key] = sensor_id
+        else:
+            self._active_resources.pop(resource_key, None)
 
     def get_available_sensor_types(self):
         # Sau này có thể load từ plugin hoặc config file
@@ -309,54 +366,61 @@ class SensorManager(QObject):
         instance = self._sensors.get(sensor_id)
         return instance.get_sensor_info() if instance else None
 
-    def get_sensor_instance(self, sensor_id): # Cần cho SensorDetailDialog
+    def get_sensor_instance(self, sensor_id):
         return self._sensors.get(sensor_id)
 
     def get_connected_sensors_count(self):
         return sum(1 for s_id in self._sensors if self._sensors[s_id].connected)
 
+    def get_inactive_sensors(self):
+        """Get list of sensor IDs that are not connected."""
+        return [s_id for s_id in self._sensors if not self._sensors[s_id].connected]
 
     def add_sensor(self, sensor_id, sensor_type, config):
         if sensor_id in self._sensors:
             logger.warning(f"Sensor ID {sensor_id} already exists. Cannot add.")
-            # Không emit connection status ở đây vì UI sẽ kiểm tra trước
+            return False
+
+        # Check for resource conflicts
+        has_conflict, conflict_msg = self._check_resource_conflict(sensor_id, config)
+        if has_conflict:
+            logger.warning(f"Resource conflict detected: {conflict_msg}")
             return False
 
         logger.info(f"SensorManager: Adding sensor {sensor_id} of type {sensor_type} with config: {config}")
         instance = SensorInstance(sensor_id, config)
-        instance.newData.connect(self.sensorDataReceived) # Chuyển tiếp tín hiệu
-        instance.connectionStatus.connect(self.sensorConnectionStatusChanged) # Chuyển tiếp
-        instance.stopped.connect(lambda sid: self._handle_sensor_stopped(sid)) # Xử lý khi sensor dừng hẳn
+        instance.newData.connect(self.sensorDataReceived)
+        instance.connectionStatus.connect(self.sensorConnectionStatusChanged)
+        instance.stopped.connect(lambda sid: self._handle_sensor_stopped(sid))
 
         self._sensors[sensor_id] = instance
-        instance.connect_sensor() # Yêu cầu instance tự kết nối
-        
-        self.sensorListChanged.emit() # Báo UI cập nhật
-        # Trạng thái kết nối sẽ được cập nhật thông qua signal connectionStatus của instance
-        return True
+        # Track configured resource
+        resource_key = self._get_resource_key(config)
+        if resource_key:
+            self._configured_resources[resource_key] = sensor_id
 
+        instance.connect_sensor()
+        self.sensorListChanged.emit()
+        return True
 
     def _handle_sensor_stopped(self, sensor_id):
         logger.info(f"SensorManager: Confirmed sensor {sensor_id} has stopped.")
-        # Có thể cần cập nhật trạng thái một lần cuối nếu worker dừng mà không phải do disconnect_sensor
         instance = self._sensors.get(sensor_id)
-        if instance and instance.connected: # Nếu nó vẫn báo connected thì cập nhật lại
+        if instance and instance.connected:
             self.sensorConnectionStatusChanged.emit(sensor_id, False, "Worker stopped unexpectedly")
-        # Không xóa instance ở đây, việc xóa sẽ do remove_sensor xử lý
-        # Nếu instance tự dừng (ví dụ do lỗi), nó sẽ phát connectionStatus(False)
-
+            # Update resource tracking
+            self._update_resource_tracking(sensor_id, instance.config, False)
 
     def connect_sensor_by_id(self, sensor_id):
         instance = self._sensors.get(sensor_id)
         if instance:
-            if not instance.connected and not instance._running: # Chỉ kết nối nếu chưa kết nối và chưa chạy
+            if not instance.connected and not instance._running:
                 logger.info(f"SensorManager: Requesting connect for sensor {sensor_id}")
                 instance.connect_sensor()
             elif instance.connected:
-                 logger.info(f"SensorManager: Sensor {sensor_id} is already connected.")
+                logger.info(f"SensorManager: Sensor {sensor_id} is already connected.")
             elif instance._running:
-                 logger.info(f"SensorManager: Sensor {sensor_id} is already in the process of connecting/running.")
-
+                logger.info(f"SensorManager: Sensor {sensor_id} is already in the process of connecting/running.")
         else:
             logger.warning(f"SensorManager: Cannot connect. Sensor ID {sensor_id} not found.")
 
@@ -365,34 +429,47 @@ class SensorManager(QObject):
         if instance:
             logger.info(f"SensorManager: Requesting disconnect for sensor {sensor_id}")
             instance.disconnect_sensor()
-            # Trạng thái sẽ được cập nhật qua signal connectionStatus khi worker thực sự dừng
+            # Resource tracking will be updated via connectionStatus signal
         else:
             logger.warning(f"SensorManager: Cannot disconnect. Sensor ID {sensor_id} not found.")
-
 
     def remove_sensor(self, sensor_id):
         instance = self._sensors.pop(sensor_id, None)
         if instance:
             logger.info(f"SensorManager: Removing sensor {sensor_id}.")
-            instance.cleanup() # Đảm bảo worker dừng và tài nguyên được giải phóng
-            # Ngắt kết nối các signal của instance này để tránh lỗi sau khi nó bị xóa
+            instance.cleanup()
+
+            # Update resource tracking
+            resource_key = self._get_resource_key(instance.config)
+            if resource_key:
+                self._configured_resources.pop(resource_key, None)
+                self._active_resources.pop(resource_key, None)
+
             try:
                 instance.newData.disconnect(self.sensorDataReceived)
                 instance.connectionStatus.disconnect(self.sensorConnectionStatusChanged)
                 instance.stopped.disconnect(self._handle_sensor_stopped)
-            except TypeError: # Lỗi nếu signal chưa bao giờ được kết nối hoặc đã ngắt
+            except TypeError:
                 pass
-            instance.deleteLater() # Hẹn xóa đối tượng QObject
-            self.sensorListChanged.emit() # Báo UI cập nhật
-            # Có thể emit một tín hiệu trạng thái đặc biệt "removed" nếu cần
+            instance.deleteLater()
+            self.sensorListChanged.emit()
             self.sensorConnectionStatusChanged.emit(sensor_id, False, "Sensor removed")
             return True
         logger.warning(f"SensorManager: Cannot remove. Sensor ID {sensor_id} not found.")
         return False
 
+    def remove_all_inactive_sensors(self):
+        """Remove all sensors that are not currently connected."""
+        inactive_sensors = self.get_inactive_sensors()
+        removed_count = 0
+        for sensor_id in inactive_sensors:
+            if self.remove_sensor(sensor_id):
+                removed_count += 1
+        return removed_count
+
     def stop_all_sensors(self):
         logger.info("SensorManager: Stopping all sensors...")
-        for sensor_id in list(self._sensors.keys()): # Dùng list key để tránh lỗi khi dict thay đổi
+        for sensor_id in list(self._sensors.keys()):
             self.disconnect_sensor_by_id(sensor_id)
-        # Chờ các sensor dừng hẳn (có thể cần cơ chế phức tạp hơn nếu cần đồng bộ chặt chẽ)
-        # time.sleep(1) # Chờ một chút cho các worker dừng
+        # Clear active resources tracking
+        self._active_resources.clear()

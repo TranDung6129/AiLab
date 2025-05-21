@@ -19,10 +19,17 @@ class DataProcessor(QObject):
             'rls_filter_q_disp': 0.9875,
             'warmup_frames': 5
         }
+        self.default_advanced_processing_params = {
+            'pre_filter_type': "None",
+            'pre_filter_params': {'cutoff_hz': 0.5, 'order': 2},
+            'integration_method': "Trapezoidal",
+            'detrend_method': "RLS",
+            'detrend_params': {'poly_order': 2}
+        }
         self.reset_all_data()
 
     def _ensure_sensor_id_structure(self, sensor_id, sensor_type="wit_motion_imu", dt=0.005,
-                                   kin_params=None):
+                                   kin_params=None, adv_params=None):
         if sensor_id not in self._sensor_data_store:
             logger.info(f"DataProcessor: Initializing data structure for sensor_id: {sensor_id}")
             
@@ -31,13 +38,19 @@ class DataProcessor(QObject):
             for key, default_val in self.default_kinematic_params.items():
                 if key not in current_kin_params:
                     current_kin_params[key] = default_val
+
+            current_adv_params = adv_params if adv_params else self.default_advanced_processing_params.copy()
+            # Ensure all required keys are present in current_adv_params, falling back to default if not
+            for key, default_val in self.default_advanced_processing_params.items():
+                if key not in current_adv_params:
+                    current_adv_params[key] = default_val
             
             self._sensor_data_store[sensor_id] = {
                 'config': {
                     'type': sensor_type, 
                     'dt': dt,
-                    # Store the actual kinematic params used for this sensor
-                    'kinematic_params': current_kin_params.copy() 
+                    'kinematic_params': current_kin_params.copy(),
+                    'advanced_processing_params': current_adv_params.copy()
                 },
                 'time_data': np.array([]),
                 'raw_acc': {'x': np.array([]), 'y': np.array([]), 'z': np.array([])},
@@ -53,13 +66,16 @@ class DataProcessor(QObject):
                         calc_frame_multiplier=current_kin_params['calc_frame_multiplier'],
                         rls_filter_q_vel=current_kin_params['rls_filter_q_vel'],
                         rls_filter_q_disp=current_kin_params['rls_filter_q_disp'],
-                        warmup_frames=current_kin_params['warmup_frames']
+                        warmup_frames=current_kin_params['warmup_frames'],
+                        integration_method=current_adv_params['integration_method'],
+                        detrend_method=current_adv_params['detrend_method'],
+                        detrend_params=current_adv_params['detrend_params']
                     ) for axis in ['x', 'y', 'z']
                 },
                 'fft_plot_data': {ax: {'freq': None, 'amp': None} for ax in ['x', 'y', 'z']},
                 'dominant_freqs': {'x': 0, 'y': 0, 'z': 0}
             }
-        else: # Sensor structure already exists, check if dt or kin_params need update
+        else: # Sensor structure already exists, check if dt or params need update
             sds_config = self._sensor_data_store[sensor_id]['config']
             config_changed = False
             if sds_config['dt'] != dt:
@@ -70,44 +86,82 @@ class DataProcessor(QObject):
                 sds_config['kinematic_params'] = kin_params.copy()
                 config_changed = True
 
+            if adv_params and sds_config.get('advanced_processing_params') != adv_params:
+                sds_config['advanced_processing_params'] = adv_params.copy()
+                config_changed = True
+
             if config_changed:
                 logger.info(f"DataProcessor: Re-initializing KinematicProcessors for {sensor_id} due to config change.")
-                current_kin_params_for_reinit = sds_config['kinematic_params']
+                current_kin_params = sds_config['kinematic_params']
+                current_adv_params = sds_config['advanced_processing_params']
                 for axis in ['x', 'y', 'z']:
                     self._sensor_data_store[sensor_id]['kinematic_processors'][axis] = KinematicProcessor(
                         dt=sds_config['dt'],
-                        sample_frame_size=current_kin_params_for_reinit['sample_frame_size'],
-                        calc_frame_multiplier=current_kin_params_for_reinit['calc_frame_multiplier'],
-                        rls_filter_q_vel=current_kin_params_for_reinit['rls_filter_q_vel'],
-                        rls_filter_q_disp=current_kin_params_for_reinit['rls_filter_q_disp'],
-                        warmup_frames=current_kin_params_for_reinit['warmup_frames']
+                        sample_frame_size=current_kin_params['sample_frame_size'],
+                        calc_frame_multiplier=current_kin_params['calc_frame_multiplier'],
+                        rls_filter_q_vel=current_kin_params['rls_filter_q_vel'],
+                        rls_filter_q_disp=current_kin_params['rls_filter_q_disp'],
+                        warmup_frames=current_kin_params['warmup_frames'],
+                        integration_method=current_adv_params['integration_method'],
+                        detrend_method=current_adv_params['detrend_method'],
+                        detrend_params=current_adv_params['detrend_params']
                     )
 
-    def update_kinematic_parameters(self, sensor_id, new_kin_params):
+    def update_processing_parameters(self, sensor_id, new_kin_params=None, new_adv_params=None):
+        """Updates both kinematic and advanced processing parameters for a sensor."""
         if sensor_id in self._sensor_data_store:
             sds = self._sensor_data_store[sensor_id]
-            sds['config']['kinematic_params'] = new_kin_params.copy() # Update stored params
-            
-            # Re-initialize KinematicProcessors with new parameters
-            logger.info(f"DataProcessor: Updating kinematic parameters for sensor {sensor_id}.")
-            for axis in ['x', 'y', 'z']:
-                sds['kinematic_processors'][axis] = KinematicProcessor(
-                    dt=sds['config']['dt'], # Use existing dt
-                    sample_frame_size=new_kin_params['sample_frame_size'],
-                    calc_frame_multiplier=new_kin_params['calc_frame_multiplier'],
-                    rls_filter_q_vel=new_kin_params['rls_filter_q_vel'],
-                    rls_filter_q_disp=new_kin_params['rls_filter_q_disp'],
-                    warmup_frames=new_kin_params['warmup_frames']
-                )
-            # Reset data arrays as processing will restart with new parameters
-            self.reset_sensor_data_arrays_only(sensor_id)
-            logger.info(f"Kinematic parameters updated and data reset for {sensor_id}.")
+            config_changed = False
+
+            if new_kin_params:
+                sds['config']['kinematic_params'] = new_kin_params.copy()
+                config_changed = True
+
+            if new_adv_params:
+                sds['config']['advanced_processing_params'] = new_adv_params.copy()
+                config_changed = True
+
+            if config_changed:
+                logger.info(f"DataProcessor: Updating processing parameters for sensor {sensor_id}.")
+                current_kin_params = sds['config']['kinematic_params']
+                current_adv_params = sds['config']['advanced_processing_params']
+                
+                # Re-initialize KinematicProcessors with new parameters
+                for axis in ['x', 'y', 'z']:
+                    sds['kinematic_processors'][axis] = KinematicProcessor(
+                        dt=sds['config']['dt'],
+                        sample_frame_size=current_kin_params['sample_frame_size'],
+                        calc_frame_multiplier=current_kin_params['calc_frame_multiplier'],
+                        rls_filter_q_vel=current_kin_params['rls_filter_q_vel'],
+                        rls_filter_q_disp=current_kin_params['rls_filter_q_disp'],
+                        warmup_frames=current_kin_params['warmup_frames'],
+                        integration_method=current_adv_params['integration_method'],
+                        detrend_method=current_adv_params['detrend_method'],
+                        detrend_params=current_adv_params['detrend_params']
+                    )
+                
+                # Reset data arrays as processing will restart with new parameters
+                self.reset_sensor_data_arrays_only(sensor_id)
+                logger.info(f"Processing parameters updated and data reset for {sensor_id}.")
         else:
-            logger.warning(f"Cannot update kinematic parameters. Sensor ID {sensor_id} not found.")
+            logger.warning(f"Cannot update processing parameters. Sensor ID {sensor_id} not found.")
+
+    def update_kinematic_parameters(self, sensor_id, new_kin_params):
+        """Legacy method for backward compatibility. Use update_processing_parameters instead."""
+        self.update_processing_parameters(sensor_id, new_kin_params=new_kin_params)
+
+    def update_advanced_processing_parameters(self, sensor_id, new_adv_params):
+        """Legacy method for backward compatibility. Use update_processing_parameters instead."""
+        self.update_processing_parameters(sensor_id, new_adv_params=new_adv_params)
 
     def get_sensor_kinematic_params(self, sensor_id):
         if sensor_id in self._sensor_data_store:
             return self._sensor_data_store[sensor_id]['config'].get('kinematic_params')
+        return None
+
+    def get_sensor_advanced_processing_params(self, sensor_id):
+        if sensor_id in self._sensor_data_store:
+            return self._sensor_data_store[sensor_id]['config'].get('advanced_processing_params')
         return None
 
     def reset_sensor_data_arrays_only(self, sensor_id):
@@ -136,9 +190,10 @@ class DataProcessor(QObject):
             dt = original_config['dt']
             sensor_type = original_config['type']
             kin_params = original_config.get('kinematic_params', self.default_kinematic_params.copy())
+            adv_params = original_config.get('advanced_processing_params', self.default_advanced_processing_params.copy())
 
             # This will effectively reset by re-initializing if it exists
-            self._ensure_sensor_id_structure(sensor_id, sensor_type, dt, kin_params)
+            self._ensure_sensor_id_structure(sensor_id, sensor_type, dt, kin_params, adv_params)
             
             # Explicitly reset data arrays after re-initialization of structure and processors
             self.reset_sensor_data_arrays_only(sensor_id)
@@ -165,7 +220,7 @@ class DataProcessor(QObject):
         _sensor_type = "unknown"
         # Default kinematic params; will be overridden if sensor already exists with custom params
         _kin_params = self.default_kinematic_params.copy()
-
+        _adv_params = self.default_advanced_processing_params.copy()
 
         if sensor_config_from_manager:
             _sensor_type = sensor_config_from_manager.get('type', 'unknown')
@@ -177,11 +232,12 @@ class DataProcessor(QObject):
             elif _sensor_type == "mock_sensor":
                  _dt = sensor_config_from_manager.get('mock_update_interval', 0.1)
             
-            # If sensor already exists, use its stored kinematic params, otherwise use defaults
+            # If sensor already exists, use its stored params, otherwise use defaults
             if sensor_id in self._sensor_data_store:
                 _kin_params = self._sensor_data_store[sensor_id]['config'].get('kinematic_params', _kin_params)
+                _adv_params = self._sensor_data_store[sensor_id]['config'].get('advanced_processing_params', _adv_params)
 
-        self._ensure_sensor_id_structure(sensor_id, _sensor_type, _dt, _kin_params)
+        self._ensure_sensor_id_structure(sensor_id, _sensor_type, _dt, _kin_params, _adv_params)
         sds = self._sensor_data_store[sensor_id]
 
         if not sensor_data_dict: return
@@ -197,6 +253,26 @@ class DataProcessor(QObject):
             accX_ms2 = accX * g_conversion
             accY_ms2 = accY * g_conversion
             accZ_ms2 = (accZ - 1.0) * g_conversion if sds['config']['type'] == "wit_motion_imu" else accZ * g_conversion
+
+            # Apply pre-filtering if configured
+            pre_filter_type = sds['config']['advanced_processing_params']['pre_filter_type']
+            if pre_filter_type != "None":
+                pre_filter_params = sds['config']['advanced_processing_params']['pre_filter_params']
+                cutoff_hz = pre_filter_params['cutoff_hz']
+                order = pre_filter_params['order']
+                
+                # Apply filter to each axis
+                for acc_ms2, axis in [(accX_ms2, 'x'), (accY_ms2, 'y'), (accZ_ms2, 'z')]:
+                    if pre_filter_type == "High-pass":
+                        acc_ms2 = self._apply_highpass_filter(acc_ms2, cutoff_hz, order, _dt)
+                    elif pre_filter_type == "Low-pass":
+                        acc_ms2 = self._apply_lowpass_filter(acc_ms2, cutoff_hz, order, _dt)
+                    # Add other filter types as needed
+                    
+                    # Update the acceleration value
+                    if axis == 'x': accX_ms2 = acc_ms2
+                    elif axis == 'y': accY_ms2 = acc_ms2
+                    else: accZ_ms2 = acc_ms2
 
             fft_buffer_size = self.N_FFT_POINTS * 2 
             sds['raw_acc']['x'] = np.append(sds['raw_acc']['x'], accX_ms2)[-fft_buffer_size:]
@@ -243,6 +319,22 @@ class DataProcessor(QObject):
 
         except Exception as e:
             logger.error(f"Error processing data for sensor {sensor_id}: {e}", exc_info=True)
+
+    def _apply_highpass_filter(self, data, cutoff_hz, order, dt):
+        """Apply a high-pass filter to the input data."""
+        from scipy.signal import butter, filtfilt
+        nyquist = 0.5 / dt
+        normal_cutoff = cutoff_hz / nyquist
+        b, a = butter(order, normal_cutoff, btype='high', analog=False)
+        return filtfilt(b, a, data)
+
+    def _apply_lowpass_filter(self, data, cutoff_hz, order, dt):
+        """Apply a low-pass filter to the input data."""
+        from scipy.signal import butter, filtfilt
+        nyquist = 0.5 / dt
+        normal_cutoff = cutoff_hz / nyquist
+        b, a = butter(order, normal_cutoff, btype='low', analog=False)
+        return filtfilt(b, a, data)
 
     def _trim_data_arrays_for_sensor(self, sensor_id, max_points=2000): # Max points for internal storage
         sds = self._sensor_data_store.get(sensor_id)

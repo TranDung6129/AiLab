@@ -72,6 +72,7 @@ class MainWindow(QMainWindow):
         # SettingsScreen -> MainWindow, PlotManager
         self.settings_screen.display_rate_changed.connect(self.handle_display_rate_change)
         self.settings_screen.kinematic_settings_applied.connect(self.handle_kinematic_settings_applied)
+        self.settings_screen.advanced_processing_settings_applied.connect(self.handle_advanced_processing_settings_applied)
 
         # DisplayScreen -> MainWindow
         self.display_screen.sensor_selection_changed.connect(self.handle_display_sensor_changed_from_combo)
@@ -96,25 +97,38 @@ class MainWindow(QMainWindow):
     def handle_add_sensor_request(self, sensor_id, sensor_type, config):
         logger.info(f"MainWindow: Received request to add sensor: {sensor_id}, type: {sensor_type}")
         
+        if config is None: # Check if config dict itself is None (error from AddSensorDialog)
+            # QMessageBox is already shown by AddSensorDialog if config is None from its get_sensor_config
+            logger.error(f"MainWindow: Received None config for sensor {sensor_id}. Aborting add.")
+            return
+
         # Prepare initial kinematic parameters (defaults or from a global setting if available)
         initial_kin_params = self.data_processor.default_kinematic_params.copy()
-        dt_for_dp = initial_kin_params.get('dt', 0.005) # Default dt
+        dt_for_dp = 0.005 # Default dt
         
         if sensor_type == "wit_motion_imu":
-            hex_val = config.get('wit_data_rate_byte_hex', "0b").lower().replace("0x","")
+            hex_val = config.get('wit_data_rate_byte_hex', "0b") # Use new hex string "0B"
+            if isinstance(hex_val, str): # Ensure it's a string
+                hex_val = hex_val.lower().replace("0x","")
             rate_map_to_dt = {"0b": 0.005, "19": 0.01, "14": 0.02, "0a": 0.05, "05": 0.1}
-            dt_for_dp = rate_map_to_dt.get(hex_val, 0.01)
+            # Add other WIT data rates if present in AddSensorDialog
+            dt_for_dp = rate_map_to_dt.get(hex_val, 0.005) # Default to 200Hz if not found
         # Add other sensor type dt calculations if necessary
 
         # Ensure DataProcessor has a structure for this sensor with initial kinematic params
-        # This will use defaults if not overridden by more specific logic later
         self.data_processor._ensure_sensor_id_structure(sensor_id, sensor_type, dt_for_dp, initial_kin_params)
 
         success = self.sensor_manager.add_sensor(sensor_id, sensor_type, config)
         if success:
             QMessageBox.information(self, "Thành công", f"Đã yêu cầu thêm cảm biến '{config.get('name', sensor_id)}'.")
         else:
-            QMessageBox.warning(self, "Lỗi", f"Cảm biến ID '{sensor_id}' có thể đã tồn tại hoặc có lỗi khi thêm.")
+            # SensorManager.add_sensor will log if ID already exists,
+            # but a warning here is fine too if add_sensor returns False for other reasons.
+            existing_sensor = self.sensor_manager.get_sensor_info(sensor_id)
+            if existing_sensor: # If it failed because it exists
+                 QMessageBox.warning(self, "Lỗi", f"Cảm biến ID '{sensor_id}' đã tồn tại.")
+            else: # Other failure reason
+                 QMessageBox.warning(self, "Lỗi", f"Không thể thêm cảm biến ID '{sensor_id}'.")
         # self.sensor_screen_new.update_sensors_table() # Covered by sensorListChanged
 
     def handle_remove_sensor_request(self, sensor_id_to_remove):
@@ -165,7 +179,12 @@ class MainWindow(QMainWindow):
             
             # Update kinematic settings tab title/state
             current_kin_params = self.data_processor.get_sensor_kinematic_params(sensor_id)
-            self.settings_screen.set_current_sensor_for_settings(sensor_id if connected else None, current_kin_params if connected else None)
+            current_adv_params = self.data_processor.get_sensor_advanced_processing_params(sensor_id)
+            self.settings_screen.set_current_sensor_for_settings(
+                sensor_id if connected else None, 
+                current_kin_params if connected else None,
+                current_adv_params if connected else None
+            )
         
         # Ensure table reflects the latest status (SensorManager should emit list changed if needed)
         # Or SensorManagementScreen can listen to connectionStatusChanged directly too.
@@ -226,7 +245,12 @@ class MainWindow(QMainWindow):
         self.tabs.setTabText(0, f"Hiển thị Đồ thị ({display_name})")
         
         current_kin_params = self.data_processor.get_sensor_kinematic_params(new_sensor_id)
-        self.settings_screen.set_current_sensor_for_settings(new_sensor_id if is_connected else None, current_kin_params if is_connected else None)
+        current_adv_params = self.data_processor.get_sensor_advanced_processing_params(new_sensor_id)
+        self.settings_screen.set_current_sensor_for_settings(
+            new_sensor_id if is_connected else None, 
+            current_kin_params if is_connected else None,
+            current_adv_params if is_connected else None
+        )
         self.advanced_analysis_screen.set_current_sensor(new_sensor_id)
 
         if is_connected:
@@ -237,7 +261,6 @@ class MainWindow(QMainWindow):
             #     QMessageBox.information(self, "Thông báo", f"Cảm biến '{display_name}' hiện chưa kết nối.")
             self.display_screen.reset_plots() # Ensure plots are clear
             self.display_screen.dominant_freq_label.setText("Tần số đặc trưng X: -- Hz, Y: -- Hz, Z: -- Hz")
-
 
     def handle_kinematic_settings_applied(self, sensor_id, settings_dict):
         if sensor_id == self.current_plotting_sensor_id:
@@ -250,6 +273,16 @@ class MainWindow(QMainWindow):
         else:
             QMessageBox.warning(self, "Lưu ý", "Cài đặt động học chỉ áp dụng cho cảm biến đang được hiển thị đồ thị.")
 
+    def handle_advanced_processing_settings_applied(self, sensor_id, settings_dict):
+        if sensor_id == self.current_plotting_sensor_id:
+            logger.info(f"Applying advanced processing settings for sensor {sensor_id}: {settings_dict}")
+            self.data_processor.update_advanced_processing_parameters(sensor_id, settings_dict)
+            # Data is reset within update_advanced_processing_parameters, plotting will use new params.
+            QMessageBox.information(self, "Thành công", f"Đã áp dụng cài đặt xử lý nâng cao cho cảm biến {sensor_id}.")
+            # If sensor was plotting, it will continue with new params after data reset.
+            # If it was not plotting but connected, it will use new params when plotting starts.
+        else:
+            QMessageBox.warning(self, "Lưu ý", "Cài đặt xử lý nâng cao chỉ áp dụng cho cảm biến đang được hiển thị đồ thị.")
 
     def handle_display_rate_change(self, rate_hz):
         logger.info(f"Display rate changed to {rate_hz} Hz")
@@ -257,7 +290,6 @@ class MainWindow(QMainWindow):
         if self.current_plotting_sensor_id and self.plot_manager.is_collecting_data:
             # Restart with new rate if already plotting
             self.plot_manager.start_plotting(rate_hz, self.current_plotting_sensor_id)
-
 
     def closeEvent(self, event):
         logger.info("Closing application...")

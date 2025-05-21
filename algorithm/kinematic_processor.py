@@ -1,19 +1,20 @@
 import numpy as np
 import logging
-from .rls_filter import RLSFilter
-from .integrator import SignalIntegrator
+from .detrenders import create_detrender
+from .integrator import create_integrator
+from .filters import create_filter
 
 logger = logging.getLogger(__name__)
 
 class KinematicProcessor:
     """
     Processes acceleration data to calculate velocity and displacement in real-time.
-    It uses numerical integration and RLS filtering to remove drift.
-    This class replaces the original RealTimeAccelerationIntegrator.
+    Supports various integration and detrending methods.
     """
     def __init__(self, dt, sample_frame_size=20, calc_frame_multiplier=100,
                  rls_filter_q_vel=0.9825, rls_filter_q_disp=0.9825,
-                 warmup_frames=5):
+                 warmup_frames=5, integration_method="Trapezoidal",
+                 detrend_method="RLS", detrend_params=None):
         """
         Initializes the KinematicProcessor.
 
@@ -25,6 +26,9 @@ class KinematicProcessor:
             rls_filter_q_vel (float): Forgetting factor for the velocity RLS filter.
             rls_filter_q_disp (float): Forgetting factor for the displacement RLS filter.
             warmup_frames (int): Number of frames to process before results are considered reliable.
+            integration_method (str): Method to use for numerical integration.
+            detrend_method (str): Method to use for detrending ("RLS", "Polynomial", or "None").
+            detrend_params (dict): Parameters for the detrending method.
         """
         self.dt = dt
         self.sample_frame_size = sample_frame_size
@@ -34,9 +38,19 @@ class KinematicProcessor:
         self.vel_buffer_detrended = np.zeros(self.calc_frame_size)
         self.disp_buffer_detrended = np.zeros(self.calc_frame_size)
 
-        self.integrator = SignalIntegrator(dt=self.dt)
-        self.rls_filter_vel = RLSFilter(filter_q=rls_filter_q_vel)
-        self.rls_filter_disp = RLSFilter(filter_q=rls_filter_q_disp)
+        # Initialize integrator with specified method
+        self.integrator = create_integrator(integration_method, dt)
+        
+        # Initialize detrending filters
+        vel_detrend_params = detrend_params or {}
+        if detrend_method == "RLS":
+            vel_detrend_params['filter_q'] = rls_filter_q_vel
+        self.vel_detrender = create_detrender(detrend_method, vel_detrend_params)
+        
+        disp_detrend_params = detrend_params or {}
+        if detrend_method == "RLS":
+            disp_detrend_params['filter_q'] = rls_filter_q_disp
+        self.disp_detrender = create_detrender(detrend_method, disp_detrend_params)
         
         # Pre-calculate time vector for the buffer length
         self.time_vector_buffer = np.arange(0, self.calc_frame_size * self.dt, self.dt)[:self.calc_frame_size]
@@ -46,7 +60,10 @@ class KinematicProcessor:
         
         logger.info(f"KinematicProcessor initialized: dt={dt}, frame_size={sample_frame_size}, "
                     f"calc_buffer_size={self.calc_frame_size}, "
-                    f"q_vel={rls_filter_q_vel}, q_disp={rls_filter_q_disp}, warmup={warmup_frames}")
+                    f"integration_method={integration_method}, "
+                    f"detrend_method={detrend_method}, "
+                    f"q_vel={rls_filter_q_vel}, q_disp={rls_filter_q_disp}, "
+                    f"warmup={warmup_frames}")
 
     def is_warmed_up(self):
         """Checks if the processor has processed enough frames for reliable output."""
@@ -58,8 +75,10 @@ class KinematicProcessor:
         self.vel_buffer_detrended.fill(0)
         self.disp_buffer_detrended.fill(0)
         
-        self.rls_filter_vel.reset()
-        self.rls_filter_disp.reset()
+        if hasattr(self.vel_detrender, 'reset'):
+            self.vel_detrender.reset()
+        if hasattr(self.disp_detrender, 'reset'):
+            self.disp_detrender.reset()
         
         self.frame_count = 0
         logger.info("KinematicProcessor reset.")
@@ -67,13 +86,25 @@ class KinematicProcessor:
     def _process_full_buffer(self):
         """
         Internal method to integrate and detrend the entire current acc_buffer.
-        RLS filters are stateful and update their state internally.
+        Filters are stateful and update their state internally.
         """
+        # Integrate acceleration to get velocity
         raw_vel_buffer = self.integrator.integrate(self.acc_buffer)
-        self.vel_buffer_detrended, _ = self.rls_filter_vel.detrend(raw_vel_buffer, self.time_vector_buffer)
         
+        # Detrend velocity if detrender exists
+        if self.vel_detrender is not None:
+            self.vel_buffer_detrended, _ = self.vel_detrender.detrend(raw_vel_buffer, self.time_vector_buffer)
+        else:
+            self.vel_buffer_detrended = raw_vel_buffer
+        
+        # Integrate velocity to get displacement
         raw_disp_buffer = self.integrator.integrate(self.vel_buffer_detrended)
-        self.disp_buffer_detrended, _ = self.rls_filter_disp.detrend(raw_disp_buffer, self.time_vector_buffer)
+        
+        # Detrend displacement if detrender exists
+        if self.disp_detrender is not None:
+            self.disp_buffer_detrended, _ = self.disp_detrender.detrend(raw_disp_buffer, self.time_vector_buffer)
+        else:
+            self.disp_buffer_detrended = raw_disp_buffer
         
         # Acceleration is not filtered in this scheme, passed through
         return self.disp_buffer_detrended, self.vel_buffer_detrended, self.acc_buffer
