@@ -332,11 +332,12 @@ class AdvancedAnalysisScreenWidget(QWidget):
             self.fft_field_selector_combo.addItems(fft_candidates)
 
 
-    def load_and_analyze_data(self):
-        if not self.current_sensor_id:
-            QMessageBox.warning(self, "Cảnh báo", "Chưa có sensor nào được chọn.")
-            self.clear_all_analysis_outputs()
-            return
+    def load_and_analyze_data(self, suppress_warning_on_empty=False):
+        # if not self.current_sensor_id:
+        #     if not suppress_warning_on_empty:
+        #         QMessageBox.warning(self, "Cảnh báo", "Chưa có sensor nào được chọn.")
+        #     self.clear_all_analysis_outputs()
+        #     return
 
         raw_data_from_dp = self.data_processor.get_plot_data_for_sensor(self.current_sensor_id)
         if not raw_data_from_dp:
